@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
@@ -33,6 +34,8 @@ import (
 )
 
 const (
+	finalizer = "in-use.crossplane.io"
+
 	errExtractEnv            = "cannot extract from environment variable when none specified"
 	errExtractFs             = "cannot extract from filesystem when no path specified"
 	errExtractSecretKey      = "cannot extract from secret key when none specified"
@@ -148,13 +151,18 @@ func (u *ProviderConfigUsageTracker) Track(ctx context.Context, mg Managed) erro
 
 	pcu.SetName(string(mg.GetUID()))
 	pcu.SetLabels(map[string]string{xpv1.LabelKeyProviderName: ref.Name})
-	pcu.SetOwnerReferences([]metav1.OwnerReference{meta.AsController(meta.TypedReferenceTo(mg, gvk))})
+
+	ownerReference := meta.AsController(meta.TypedReferenceTo(mg, gvk))
+	ownerReference.BlockOwnerDeletion = ptr.To(false)
+
+	pcu.SetOwnerReferences([]metav1.OwnerReference{ownerReference})
 	pcu.SetProviderConfigReference(xpv1.Reference{Name: ref.Name})
 	pcu.SetResourceReference(xpv1.TypedReference{
 		APIVersion: gvk.GroupVersion().String(),
 		Kind:       gvk.Kind,
 		Name:       mg.GetName(),
 	})
+	pcu.SetFinalizers([]string{finalizer})
 
 	err := u.c.Apply(ctx, pcu,
 		MustBeControllableBy(mg.GetUID()),

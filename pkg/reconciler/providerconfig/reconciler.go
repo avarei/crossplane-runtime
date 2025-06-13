@@ -24,8 +24,13 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -43,9 +48,11 @@ const (
 	timeout   = 2 * time.Minute
 
 	errGetPC        = "cannot get ProviderConfig"
+	errGetPCUOwner  = "cannot get Controlling Resource of ProviderConfigUsage"
 	errListPCUs     = "cannot list ProviderConfigUsages"
 	errDeletePCU    = "cannot delete ProviderConfigUsage"
 	errUpdate       = "cannot update ProviderConfig"
+	errUpdateUsage  = "cannot update ProviderConfigUsage"
 	errUpdateStatus = "cannot update ProviderConfig status"
 )
 
@@ -173,17 +180,62 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reco
 
 	users := int64(len(l.GetItems()))
 	for _, pcu := range l.GetItems() {
-		if metav1.GetControllerOf(pcu) == nil {
+		r.log.Debug("checking pcu", "pcu", pcu, "controllerReference", metav1.GetControllerOf(pcu))
+		controller := metav1.GetControllerOf(pcu)
+		if controller == nil {
 			// Usages should always have a controller reference. If this one has
 			// none it's probably been stripped off (e.g. by a Velero restore).
 			// We can safely delete it - it's either stale, or will be recreated
 			// next time the relevant managed resource connects.
+			r.log.Debug("removing finalizer due to missing controller refrence")
+
+			if controllerutil.RemoveFinalizer(pcu, finalizer) {
+				if err := r.client.Update(ctx, pcu); err != nil {
+					r.log.Debug(errUpdate, "error", err)
+					return reconcile.Result{RequeueAfter: shortWait}, nil
+				}
+			}
+
 			if err := r.client.Delete(ctx, pcu); resource.IgnoreNotFound(err) != nil {
 				log.Debug(errDeletePCU, "error", err)
 				r.record.Event(pc, event.Warning(reasonAccount, errors.Wrap(err, errDeletePCU)))
 				return reconcile.Result{RequeueAfter: shortWait}, nil
 			}
 			users--
+			continue
+		}
+
+		if meta.WasDeleted(pcu) {
+			// check if controller resource is gone.
+			u := &unstructured.Unstructured{}
+			u.SetGroupVersionKind(schema.FromAPIVersionAndKind(controller.APIVersion, controller.Kind))
+
+			err := r.client.Get(ctx, types.NamespacedName{Name: controller.Name, Namespace: pcu.GetNamespace()}, u)
+			if kerrors.IsNotFound(err) {
+				r.log.Debug("removing pcu finalizer due to resource not found")
+				if controllerutil.RemoveFinalizer(pcu, finalizer) {
+					if err := r.client.Update(ctx, pcu); err != nil {
+						r.log.Debug(errUpdate, "error", err)
+						return reconcile.Result{RequeueAfter: shortWait}, nil
+					}
+				}
+				users--
+			} else if err != nil {
+				r.log.Debug(errGetPCUOwner, "error", err)
+				return reconcile.Result{RequeueAfter: shortWait}, nil
+			} else if u.GetUID() != controller.UID {
+				r.log.Debug("removing pcu finalizer due to uuid mismatch", "mrUid", u.GetUID(), "pcuUid", controller.UID, "pcu", pcu)
+				if controllerutil.RemoveFinalizer(pcu, finalizer) {
+					if err := r.client.Update(ctx, pcu); err != nil {
+						r.log.Debug(errUpdate, "error", err)
+						return reconcile.Result{RequeueAfter: shortWait}, nil
+					}
+				}
+				users--
+			} else {
+				// providerconfig usage is deleting, but owner is still present. there will be no changes on pc or pcu so we need to reque
+				return reconcile.Result{RequeueAfter: shortWait}, nil
+			}
 		}
 	}
 	log = log.WithValues("usages", users)
